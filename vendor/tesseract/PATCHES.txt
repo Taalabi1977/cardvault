@@ -1,0 +1,1 @@
+worker.min.js: patched one line so language objects initialise by .code (upstream bug in tesseract.js 6.0.1 worker-script/index.js initialize).
