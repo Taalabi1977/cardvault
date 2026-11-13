@@ -12,7 +12,18 @@
   // Constants
   // ------------------------------------------------------------------
   const DB_NAME = 'cardvault';
+  // App + data versions. Rule for every future update: IndexedDB stores are only ever
+  // ADDED (never deleted or renamed), and contact changes go through MIGRATIONS below,
+  // so saved cards always survive an update.
+  const APP_VERSION = '1.1.0';
   const DB_VERSION = 1;
+  const DATA_VERSION = 2;
+  const WHATS_NEW = [
+    'After saving a card: add it to your phone contacts or export it to Excel in one tap.',
+    'Excel export of one card, a filtered list (for example one event) or all cards, ready to send by WhatsApp, WeChat, email, AirDrop or Bluetooth.',
+    'Phone contacts now include the card photo, where you met, tags, follow-up and notes.',
+    'Safe updates: new versions install without touching your saved cards, and the app tells you when an update is ready.',
+  ];
   const KDF_ITERATIONS = 600000;
   const MAX_FREE_ATTEMPTS = 5;
   const HIDDEN_LOCK_MS = 60 * 1000;
@@ -65,6 +76,9 @@
     plus: '<path d="M12 5v14M5 12h14"/>',
     download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
     upload: '<path d="M12 20V9M7 14l5-5 5 5M5 4h14"/>',
+    share: '<path d="M12 3v12M7 8l5-5 5 5"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/>',
+    sheet: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/>',
+    refresh: '<path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 3v5h5"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 21v-5h-5"/>',
   };
   const icon = (name) =>
     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name]}</svg>`;
@@ -165,6 +179,42 @@
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
+  const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  function canShareFile(file) {
+    try { return !!(navigator.canShare && navigator.share && navigator.canShare({ files: [file] })); } catch (e) { return false; }
+  }
+  // Shows a sheet for a file that is ready. Tapping a button there is a fresh tap,
+  // which phones require before they open the share menu.
+  function offerFile(file, opts) {
+    const share = canShareFile(file);
+    openSheet(`<h2>${esc(opts.title)}</h2>
+      ${opts.body ? `<p class="muted small">${opts.body}</p>` : ''}
+      <p class="xs mono muted">${esc(file.name)} · ${Math.max(1, Math.round(file.size / 1024))} KB</p>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${share ? `<button class="btn btn-primary" id="fShare">${icon('share')} ${esc(opts.shareLabel || 'Send or save…')}</button>` : ''}
+        <button class="btn ${share ? '' : 'btn-primary'}" id="fDl">${icon('download')} ${esc(opts.downloadLabel || 'Download to this phone')}</button>
+        <button class="btn btn-ghost" data-close>Close</button>
+      </div>
+      ${opts.foot ? `<p class="xs muted">${opts.foot}</p>` : ''}`);
+    if ($('#fShare')) $('#fShare').addEventListener('click', async () => {
+      try {
+        await navigator.share({ files: [file], title: file.name });
+        closeSheet();
+        if (opts.onDone) opts.onDone();
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // the person closed the share menu
+        downloadFile(file.name, file.type, file);
+        closeSheet();
+      }
+    });
+    $('#fDl').addEventListener('click', () => {
+      downloadFile(file.name, file.type, file);
+      closeSheet();
+      toast(opts.downloadToast || 'File downloaded');
+      if (opts.onDone) opts.onDone();
+    });
+  }
+
   async function copyText(text) {
     try {
       await navigator.clipboard.writeText(text);
@@ -252,8 +302,27 @@
     return { id: c.id, iv, ct };
   }
   async function openContact(key, rec) {
-    return JSON.parse(dec.decode(await decryptBytes(key, rec, 'contact:' + rec.id)));
+    return normalizeContact(JSON.parse(dec.decode(await decryptBytes(key, rec, 'contact:' + rec.id))));
   }
+  // Fills in any field an older version did not have, so old cards always open in new versions.
+  function normalizeContact(c) {
+    const d = {
+      name: '', title: '', company: '', phones: [], emails: [], website: '', address: '',
+      cardFront: null, cardBack: null, eventPhoto: null, tags: [], notes: '', ocrText: '', ocrLangs: [],
+      createdAt: Date.now(), updatedAt: Date.now(), exportedToPhoneAt: null,
+    };
+    for (const k in d) if (c[k] === undefined) c[k] = d[k];
+    c.met = Object.assign({ date: '', event: '', place: '' }, c.met || {});
+    c.followUp = Object.assign({ date: '', note: '', done: false }, c.followUp || {});
+    if (!Array.isArray(c.phones)) c.phones = [];
+    if (!Array.isArray(c.emails)) c.emails = [];
+    if (!Array.isArray(c.tags)) c.tags = [];
+    return c;
+  }
+  // Data migrations, keyed by the data version they lead to. Each takes a contact and returns it.
+  const MIGRATIONS = {
+    2: (c) => normalizeContact(c), // 1.0 -> 1.1: adds exportedToPhoneAt, fills defaults
+  };
   async function sealBlob(key, id, bytes) {
     const { iv, ct } = await encryptBytes(key, bytes, 'blob:' + id);
     return { id, iv, ct };
@@ -328,6 +397,9 @@
     const check = await makeCheck(key);
     const vault = { v: 1, salt, iterations: KDF_ITERATIONS, check, createdAt: Date.now() };
     await idb.put('meta', vault, 'vault');
+    await idb.put('meta', DATA_VERSION, 'dataVersion');
+    S.settings.seenVersion = APP_VERSION;
+    await saveSettings();
     S.vault = vault;
     S.key = key;
     try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (e) { /* optional */ }
@@ -354,7 +426,36 @@
     await loadContacts();
   }
 
+  // Runs after unlock (cards are encrypted, so changes need the key). Saves a safety copy first,
+  // then rewrites every card in ONE transaction: either all cards are updated or none.
+  async function runMigrations() {
+    const from = (await idb.get('meta', 'dataVersion')) || 1;
+    if (from > DATA_VERSION) {
+      toast('These cards were saved by a newer CardVault. Update the app before editing.');
+      return;
+    }
+    if (from === DATA_VERSION) return;
+    const recs = await idb.all('contacts');
+    if (recs.length) {
+      await idb.put('meta', { fromVersion: from, at: Date.now(), records: recs }, 'snapshot');
+      const updated = [];
+      for (const r of recs) {
+        let c = JSON.parse(dec.decode(await decryptBytes(S.key, r, 'contact:' + r.id)));
+        for (let v = from + 1; v <= DATA_VERSION; v++) if (MIGRATIONS[v]) c = MIGRATIONS[v](c);
+        updated.push(await sealContact(S.key, c));
+      }
+      await run(['contacts', 'meta'], 'readwrite', (t) => {
+        const st = t.objectStore('contacts');
+        updated.forEach((r) => st.put(r));
+        t.objectStore('meta').put(DATA_VERSION, 'dataVersion');
+      });
+    } else {
+      await idb.put('meta', DATA_VERSION, 'dataVersion');
+    }
+  }
+
   async function loadContacts() {
+    await runMigrations();
     const recs = await idb.all('contacts');
     const out = [];
     for (const r of recs) {
@@ -597,6 +698,7 @@
         clearInterval(tick);
         markActive();
         renderApp();
+        afterUnlock();
       } catch (ex) {
         btn.disabled = false;
         btn.innerHTML = `${icon('lock')} Unlock`;
@@ -766,6 +868,7 @@
       </header>
       <div class="content">
         <div class="list-meta"><span class="small muted mono" id="count">${list.length} of ${total}</span>
+          <button class="btn btn-sm" id="xlsList" aria-label="Export the cards shown to Excel">${icon('sheet')} Excel</button>
           <div class="chips"><button class="chip btn-sm" data-sort="recent" aria-pressed="${S.sort === 'recent'}">Recent</button><button class="chip btn-sm" data-sort="name" aria-pressed="${S.sort === 'name'}">A–Z</button></div></div>
         <div id="results">${resultsHtml(list)}</div>
       </div>`;
@@ -791,6 +894,8 @@
     $$('[data-sort]').forEach((b) => b.addEventListener('click', () => { S.sort = b.dataset.sort; renderApp(); }));
     const ln = $('#lockNow');
     if (ln) ln.addEventListener('click', () => lock('Locked.'));
+    const xl = $('#xlsList');
+    if (xl) xl.addEventListener('click', () => exportExcel(filteredContacts(), S.filter ? S.filter.value : S.query || 'all-cards'));
     const ex = $('#examples');
     if (ex) ex.addEventListener('click', addExamples);
   }
@@ -937,7 +1042,11 @@
         ${c.notes ? `<div class="panel"><div class="panel-h"><h2>Notes</h2></div><p dir="auto" style="white-space:pre-wrap">${esc(c.notes)}</p></div>` : ''}
         ${c.ocrText ? `<details class="raw"><summary>Text read from the card</summary><pre dir="auto">${esc(c.ocrText)}</pre></details>` : ''}
         <div class="btn-row">
-          <button class="btn" id="vcf">${icon('user')} Save to phone contacts</button>
+          <button class="btn" id="vcf">${icon('user')} Add to phone contacts</button>
+          <button class="btn" id="xls">${icon('sheet')} Export to Excel</button>
+        </div>
+        ${c.exportedToPhoneAt ? `<p class="xs muted">Added to phone contacts on ${esc(new Date(c.exportedToPhoneAt).toLocaleDateString())}. If you change this card, add it again and choose “Add to Existing Contact”.</p>` : ''}
+        <div class="btn-row">
           <button class="btn btn-danger" id="del">${icon('trash')} Delete</button>
         </div>
         <p class="xs muted mono">Added ${esc(new Date(c.createdAt).toLocaleString())}${fuDays !== null ? '' : ''}</p>
@@ -946,7 +1055,8 @@
     $('#back').addEventListener('click', () => { S.screen = 'list'; renderApp(); });
     $('#edit').addEventListener('click', () => startEdit(c));
     $$('[data-copy]').forEach((b) => b.addEventListener('click', () => copyText(b.dataset.copy)));
-    $('#vcf').addEventListener('click', () => exportVCard([c]));
+    $('#vcf').addEventListener('click', () => addToPhoneContacts(c));
+    $('#xls').addEventListener('click', () => exportExcel([c], c.name || c.company));
     $('#del').addEventListener('click', () =>
       confirmSheet('Delete this card?', `${c.name || c.company || 'This card'} and its photos will be removed from this phone.`, 'Delete card', async () => {
         await deleteContact(c);
@@ -1307,13 +1417,28 @@
       S.screen = 'detail';
       renderApp();
       window.scrollTo(0, 0);
-      toast(d.isNew ? 'Card saved' : 'Changes saved');
+      afterSaveSheet(c, d.isNew);
     } catch (e) {
       console.error(e);
       btn.disabled = false;
       btn.innerHTML = `${icon('check')} Save card`;
       toast('Saving failed. Your phone may be out of storage.');
     }
+  }
+
+  // After saving: the card is in CardVault; offer the two other destinations.
+  function afterSaveSheet(c, isNew) {
+    openSheet(`<div class="panel-h"><h2>${isNew ? 'Card saved' : 'Changes saved'}</h2><span class="tag">${icon('lock').replace('<svg', '<svg width="12" height="12"')} In CardVault</span></div>
+      <p class="muted small" dir="auto">${esc(c.name || c.company || 'This card')} is saved and encrypted in CardVault. Do you also want to:</p>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button class="btn" id="asPhone">${icon('user')} Add to my phone contacts</button>
+        <button class="btn" id="asExcel">${icon('sheet')} Export to Excel and send</button>
+        ${isNew ? `<button class="btn btn-primary" id="asNext">${icon('camera')} Scan the next card</button>` : ''}
+        <button class="btn btn-ghost" data-close>Done</button>
+      </div>`);
+    $('#asPhone').addEventListener('click', () => addToPhoneContacts(c));
+    $('#asExcel').addEventListener('click', () => exportExcel([c], c.name || c.company));
+    if ($('#asNext')) $('#asNext').addEventListener('click', () => { closeSheet(); startEdit(null); });
   }
 
   // ------------------------------------------------------------------
@@ -1523,12 +1648,37 @@
     out.push(line);
     return out.join('\r\n');
   }
-  function vcardFor(c) {
+  function contextNote(c) {
+    const met = [c.met && c.met.event ? 'Met at ' + c.met.event : 'Met', c.met && c.met.place ? 'in ' + c.met.place : '', c.met && c.met.date ? 'on ' + c.met.date : ''].filter(Boolean).join(' ');
+    return [
+      c.met && (c.met.event || c.met.place || c.met.date) ? met : '',
+      (c.tags || []).length ? 'Tags: ' + c.tags.join(', ') : '',
+      c.followUp && c.followUp.date ? `Follow-up ${c.followUp.date}${c.followUp.note ? ': ' + c.followUp.note : ''}${c.followUp.done ? ' (done)' : ''}` : '',
+      c.notes || '',
+      'Saved with CardVault',
+    ].filter(Boolean).join('\n');
+  }
+  // Small JPEG of the card front for the phone contact's picture.
+  async function cardThumbBase64(c) {
+    if (!c.cardFront) return '';
+    try {
+      const url = await imageUrl(c.cardFront);
+      const blob = await (await fetch(url)).blob();
+      const bmp = await loadBitmap(blob);
+      const scale = Math.min(1, 480 / Math.max(bmp.width, bmp.height));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(bmp.width * scale);
+      cv.height = Math.round(bmp.height * scale);
+      cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+      if (bmp.close) bmp.close();
+      return b64.from(new Uint8Array(await (await canvasToBlob(cv, 0.75)).arrayBuffer()));
+    } catch (e) { return ''; }
+  }
+  function vcardFor(c, photoB64) {
     const parts = (c.name || '').trim().split(/\s+/);
     const last = parts.length > 1 ? parts.pop() : '';
     const first = parts.join(' ');
     const typeMap = { mobile: 'CELL', work: 'WORK,VOICE', phone: 'VOICE', fax: 'WORK,FAX', home: 'HOME,VOICE' };
-    const ctx = [c.met && c.met.event ? 'Met at ' + c.met.event : '', c.met && c.met.place ? 'in ' + c.met.place : '', c.met && c.met.date ? 'on ' + c.met.date : ''].filter(Boolean).join(' ');
     const lines = [
       'BEGIN:VCARD', 'VERSION:3.0',
       `N:${vEsc(last)};${vEsc(first)};;;`,
@@ -1540,12 +1690,73 @@
       c.website ? `URL:${vEsc(c.website)}` : '',
       c.address ? `ADR;TYPE=WORK:;;${vEsc(c.address)};;;;` : '',
       (c.tags || []).length ? `CATEGORIES:${c.tags.map(vEsc).join(',')}` : '',
-      ctx || c.notes ? `NOTE:${vEsc([ctx, c.notes].filter(Boolean).join('\n'))}` : '',
+      `NOTE:${vEsc(contextNote(c))}`,
+      photoB64 ? `PHOTO;ENCODING=b;TYPE=JPEG:${photoB64}` : '',
       'END:VCARD',
     ].filter(Boolean);
     return lines.map(fold).join('\r\n');
   }
   function safeName(s) { return (String(s || 'contact').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '') || 'contact').slice(0, 40); }
+  async function addToPhoneContacts(c) {
+    toast('Preparing contact…');
+    const photo = await cardThumbBase64(c);
+    const file = new File([vcardFor(c, photo) + '\r\n'], safeName(c.name || c.company) + '.vcf', { type: 'text/vcard' });
+    const markDone = async () => {
+      c.exportedToPhoneAt = Date.now();
+      await saveContact(c);
+      if (S.screen === 'detail') renderDetail();
+    };
+    offerFile(file, {
+      title: 'Add to phone contacts',
+      body: IS_IOS
+        ? 'Tap <strong>Open in Contacts</strong>, choose <strong>Contacts</strong> in the list (swipe the row of apps if needed), then tap <strong>Create New Contact</strong>. If Contacts is not offered, use <strong>Download</strong>, open the file, and tap <strong>Create New Contact</strong>.'
+        : 'Tap <strong>Open in Contacts</strong> and choose your <strong>Contacts</strong> app. Or use <strong>Download</strong>, then open the file from your notifications and tap <strong>Import</strong> or <strong>Save</strong>.',
+      shareLabel: 'Open in Contacts',
+      downloadLabel: 'Download contact card (.vcf)',
+      downloadToast: 'Contact card downloaded. Open it to add it to your phone.',
+      foot: 'Your phone keeps its own copy, outside CardVault’s encryption. Changes you make later in CardVault are not copied automatically: add the card again and choose “Add to Existing Contact”.',
+      onDone: markDone,
+    });
+  }
+
+  // ---------- Excel ----------
+  const EXCEL_COLUMNS = [
+    { header: 'Name', width: 24 }, { header: 'Job title', width: 24 }, { header: 'Company', width: 26 },
+    { header: 'Mobile', width: 20 }, { header: 'Work phone', width: 20 }, { header: 'Other phones', width: 22 },
+    { header: 'Email', width: 30 }, { header: 'Other emails', width: 26 }, { header: 'Website', width: 24 },
+    { header: 'Address', width: 34 }, { header: 'Date met', width: 12 }, { header: 'Event', width: 26 },
+    { header: 'Place', width: 22 }, { header: 'Tags', width: 22 }, { header: 'Follow-up date', width: 14 },
+    { header: 'Follow-up', width: 28 }, { header: 'Follow-up done', width: 10 }, { header: 'Notes', width: 44 },
+    { header: 'Added to CardVault', width: 18 },
+  ];
+  function excelRow(c) {
+    const phones = (c.phones || []).slice();
+    const take = (label) => { const i = phones.findIndex((p) => p.label === label); return i >= 0 ? phones.splice(i, 1)[0].value : ''; };
+    const mobile = take('mobile');
+    const work = take('work') || take('phone');
+    const others = phones.map((p) => `${PHONE_LABELS[p.label] || 'Phone'}: ${p.value}`).join('; ');
+    const emails = c.emails || [];
+    return [
+      c.name, c.title, c.company, mobile, work, others, emails[0] || '', emails.slice(1).join('; '), c.website, c.address,
+      c.met && c.met.date, c.met && c.met.event, c.met && c.met.place, (c.tags || []).join(', '),
+      c.followUp && c.followUp.date, c.followUp && c.followUp.note, c.followUp && c.followUp.date ? (c.followUp.done ? 'Yes' : 'No') : '',
+      c.notes, c.createdAt ? isoDate(new Date(c.createdAt)) : '',
+    ];
+  }
+  function exportExcel(list, label) {
+    if (!list.length) { toast('No cards to export.'); return; }
+    const sorted = list.slice().sort((a, b) => (a.name || a.company || '').localeCompare(b.name || b.company || ''));
+    const bytes = CardXlsx.buildXlsx(EXCEL_COLUMNS, sorted.map(excelRow), 'Contacts');
+    const name = (list.length === 1 ? safeName(label) : `CardVault-${safeName(label || 'contacts')}-${todayISO()}`) + '.xlsx';
+    const file = new File([bytes], name, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    offerFile(file, {
+      title: list.length === 1 ? 'Excel file ready' : `Excel file ready: ${list.length} cards`,
+      body: 'Tap <strong>Send or save…</strong> to choose WhatsApp, WeChat, Mail, ' + (IS_IOS ? 'AirDrop or <strong>Save to Files</strong>.' : 'Bluetooth, Drive or <strong>Save</strong>.'),
+      downloadToast: 'Excel file downloaded',
+      foot: 'The Excel file is not encrypted. Anyone who receives it can read it.',
+    });
+  }
+
   function exportVCard(list) {
     const data = list.map(vcardFor).join('\r\n') + '\r\n';
     const name = list.length === 1 ? safeName(list[0].name || list[0].company) + '.vcf' : `cardvault-contacts-${todayISO()}.vcf`;
@@ -1583,8 +1794,15 @@
       check: { iv: b64.from(v.check.iv), ct: b64.from(v.check.ct) },
       contacts: contacts.map(pack), blobs: blobs.map(pack),
     };
-    downloadFile(`cardvault-backup-${todayISO()}.cardvault`, 'application/octet-stream', JSON.stringify(data));
-    toast(`Backup of ${contacts.length} cards ready`);
+    const file = new File([JSON.stringify(data)], `cardvault-backup-${todayISO()}.cardvault`, { type: 'application/octet-stream' });
+    const done = async () => { S.settings.lastBackupAt = Date.now(); await saveSettings(); if (S.tab === 'settings' && S.screen === 'list') renderApp(); };
+    offerFile(file, {
+      title: `Backup of ${contacts.length} cards ready`,
+      body: IS_IOS ? 'Tap <strong>Send or save…</strong>, then <strong>Save to Files</strong> and pick iCloud Drive.' : 'Tap <strong>Send or save…</strong> and pick Google Drive, or download it.',
+      downloadToast: 'Backup downloaded',
+      foot: 'The backup stays encrypted with your master password.',
+      onDone: done,
+    });
   }
 
   async function importBackup(data, password) {
@@ -1683,8 +1901,16 @@
             <p class="error" id="impErr" hidden></p>
             <div class="btn-row"><button type="button" class="btn" id="impCancel">Cancel</button><button type="submit" class="btn btn-primary" id="impGo">Import</button></div>
           </form>` : ''}
-        <button class="btn" id="vcfAll" ${S.contacts.length ? '' : 'disabled'}>${icon('user')} Export all as contacts file (.vcf)</button>
-        <p class="xs muted">The contacts file is not encrypted. Use it to move cards into your phone's address book or share them with a colleague.</p>
+        <p class="xs muted">${S.settings.lastBackupAt ? `Last backup: ${esc(new Date(S.settings.lastBackupAt).toLocaleDateString())}.` : 'No backup made yet on this phone.'}</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h"><h2>Export</h2></div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <button class="btn" id="xlsAll" ${S.contacts.length ? '' : 'disabled'}>${icon('sheet')} Export all cards to Excel</button>
+          <button class="btn" id="vcfAll" ${S.contacts.length ? '' : 'disabled'}>${icon('user')} Export all as contacts file (.vcf)</button>
+        </div>
+        <p class="xs muted">Excel and contacts files are not encrypted. Use them to share cards with a colleague or move them to another app.</p>
       </div>
 
       <div class="panel">
@@ -1702,7 +1928,13 @@
         <div class="panel-h"><h2>Erase</h2></div>
         <button class="btn btn-danger" id="wipe">${icon('trash')} Erase all cards on this device</button>
       </div>
-      <p class="xs muted mono" style="text-align:center">CardVault 1.0 · personal edition</p>
+      <div class="panel">
+        <div class="panel-h"><h2>App version</h2><span class="mono small">${APP_VERSION}</span></div>
+        <p class="small muted">Updates install by themselves when the phone is online. Your saved cards are never touched by an update.</p>
+        <div class="btn-row"><button class="btn" id="checkUpd">${icon('refresh')} Check for updates</button><button class="btn" id="showNew">What’s new</button></div>
+        <p class="xs muted" id="updStatus"></p>
+      </div>
+      <p class="xs muted mono" style="text-align:center">CardVault ${APP_VERSION} · personal edition</p>
     </div>`;
   }
 
@@ -1781,6 +2013,9 @@
       }
     });
     $('#vcfAll').addEventListener('click', () => exportVCard(S.contacts));
+    $('#xlsAll').addEventListener('click', () => exportExcel(S.contacts, 'all-cards'));
+    $('#showNew').addEventListener('click', showWhatsNew);
+    $('#checkUpd').addEventListener('click', checkForUpdate);
     $('#wipe').addEventListener('click', () => {
       openSheet(`<h2>Erase all cards?</h2>
         <p class="muted">All ${S.contacts.length} cards, photos and the master password are deleted from this phone. This cannot be undone. Export a backup first if you may need them.</p>
@@ -1822,6 +2057,75 @@
   }
 
   // ------------------------------------------------------------------
+  // Updates
+  // ------------------------------------------------------------------
+  // The app's code is cached by the service worker. When a new version is published,
+  // the phone downloads it in the background; the cards in IndexedDB are not touched.
+  let swReg = null;
+  let updateReady = false;
+  function showUpdateBanner() {
+    if ($('#updBanner')) return;
+    const b = document.createElement('div');
+    b.id = 'updBanner';
+    b.className = 'update-banner';
+    b.innerHTML = `<span>A new version of CardVault is ready.</span><button class="btn btn-sm btn-primary" id="updGo">Restart now</button>`;
+    document.body.appendChild(b);
+    $('#updGo').addEventListener('click', () => {
+      if (S.screen === 'edit') { toast('Save or cancel the card first.'); return; }
+      location.reload();
+    });
+  }
+  async function checkForUpdate() {
+    const st = $('#updStatus');
+    if (!swReg) { if (st) st.textContent = 'Updates work once CardVault is installed from its web address.'; return; }
+    if (st) st.textContent = 'Checking…';
+    try {
+      await swReg.update();
+      setTimeout(() => {
+        const s2 = $('#updStatus');
+        if (!s2) return;
+        s2.textContent = updateReady || swReg.installing || swReg.waiting ? 'Update found. Tap “Restart now” when you are ready.' : `You have the latest version (${APP_VERSION}).`;
+      }, 2500);
+    } catch (e) {
+      if (st) st.textContent = 'Could not check. Connect to the internet and try again.';
+    }
+  }
+  function registerSW() {
+    if (!('serviceWorker' in navigator) || !(location.protocol === 'https:' || location.hostname === 'localhost')) return;
+    try {
+      let controller = navigator.serviceWorker.controller;
+      navigator.serviceWorker.register('sw.js').then((reg) => {
+        swReg = reg;
+        let lastCheck = Date.now();
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && Date.now() - lastCheck > 3600000) { lastCheck = Date.now(); reg.update().catch(() => {}); }
+        });
+      }).catch(() => {});
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        const had = !!controller;
+        controller = navigator.serviceWorker.controller;
+        if (!had) return; // first install of the offline copy: nothing to restart
+        updateReady = true;
+        showUpdateBanner();
+      });
+    } catch (e) { /* not available */ }
+  }
+  function showWhatsNew() {
+    openSheet(`<h2>What’s new in CardVault ${APP_VERSION}</h2>
+      <ul class="small" style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px">${WHATS_NEW.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>
+      <p class="xs muted">All your saved cards were kept.</p>
+      <button class="btn btn-primary" data-close>OK</button>`);
+  }
+  async function afterUnlock() {
+    if (S.settings.seenVersion !== APP_VERSION) {
+      const first = !S.settings.seenVersion && !S.contacts.length;
+      S.settings.seenVersion = APP_VERSION;
+      await saveSettings();
+      if (!first) showWhatsNew();
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Boot
   // ------------------------------------------------------------------
   async function boot() {
@@ -1836,9 +2140,7 @@
       app().innerHTML = `<main class="lock"><div class="lock-mark">${LOGO}</div><h1>CardVault</h1>
         <p class="note danger">This browser cannot store encrypted data here. Open CardVault in Safari (iPhone) or Chrome (Android), and not in a private window.</p></main>`;
     }
-    if ('serviceWorker' in navigator && location.protocol === 'https:') {
-      try { navigator.serviceWorker.register('sw.js').catch(() => {}); } catch (e) { /* not available */ }
-    }
+    registerSW();
   }
   boot();
 })();

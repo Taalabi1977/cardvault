@@ -9,7 +9,9 @@ A private business card file for your phone. You photograph a card, the phone re
 - **Context.** Records the date, place and event where you met, plus tags, notes and a photo from the event. Scanning many cards at one trade fair? Tick "Use this … for my next cards".
 - **Follow-ups.** Groups reminders as overdue, today, next 7 days or later. A reminder can be added to the phone calendar (.ics file with an alert).
 - **Search.** Instant search across every field, including the full text of the card. Filter by tag or by event.
-- **Contacts out.** Export one contact or all of them as a .vcf file, which can go into the phone's address book or to a colleague.
+- **After saving a card**, three choices: keep it in CardVault only, **add it to the phone's contacts**, or **export it to Excel and send it**.
+- **Phone contacts.** The contact gets every field, the photo of the card, and a note with where and when you met, tags, follow-up and notes.
+- **Excel.** Export one card, the cards on screen (for example one event or one tag) or all cards to a real .xlsx file. The phone's share menu then offers WhatsApp, WeChat, Mail, AirDrop, Bluetooth, Save to Files or Drive.
 
 ## Security
 
@@ -44,6 +46,28 @@ Other free hosts that work: Netlify, Cloudflare Pages, Vercel.
 
 Send them the same address. Each person gets an empty vault with their own password on their own phone. Nothing is shared between people unless you export a contact (.vcf) or a backup and send it to them.
 
+## Updating the app (your cards are kept)
+
+Your cards live in the phone's own storage for this web address, separate from the app's program files. An update replaces only the program files.
+
+**To publish a new version** (GitHub Pages):
+1. Open your `cardvault` repository on github.com.
+2. Click **Add file → Upload files**.
+3. Drag in **everything inside** the new `cardvault` folder. Files with the same name are replaced.
+4. Click **Commit changes**. Wait 2 minutes.
+
+**On the phone:** open CardVault with internet. It downloads the new version in the background, then shows **"A new version of CardVault is ready"**. Tap **Restart now** and enter your password. You can also go to **Settings → Check for updates**.
+
+**What protects your data during an update:**
+- The database is never deleted or rebuilt. New versions may only *add* storage.
+- When a version changes how cards are stored, it first saves a safety copy, then converts all cards in one step: either every card is converted or none is.
+- Old cards are always completed with any new fields, so they open in every later version.
+- If downloading a new version fails halfway, the phone keeps the version it had.
+
+**Important:** always keep the **same web address**. Each web address has its own storage on the phone. If you move the app to another address, export a backup first and import it in the new place.
+
+**For developers:** with each release, raise `APP_VERSION` in `app.js` and `VERSION` in `sw.js` together. When the stored card format changes, raise `DATA_VERSION` and add a step to `MIGRATIONS`. Never delete an IndexedDB store.
+
 ## Try it on a computer
 
 ```bash
@@ -57,6 +81,7 @@ Then open http://localhost:8000.
 
 ```bash
 node tests/parser.test.js
+node tests/xlsx.test.js /tmp/test.xlsx
 ```
 
 ## Files
@@ -66,6 +91,7 @@ index.html             app page
 styles.css             design
 app.js                 app logic: vault, encryption, screens, OCR, export
 parser.js              turns card text into fields (pure functions, tested)
+xlsx.js                builds Excel files on the phone (no outside library)
 sw.js                  offline support
 manifest.webmanifest   install-to-home-screen settings
 icons/                 app icons
